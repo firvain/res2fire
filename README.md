@@ -1,8 +1,8 @@
 # res2fire
 
-Analyze vegetation recovery in fire-affected areas using Landsat Collection 2 time series.
+Fetch annual NBR and NDVI time series from Landsat Collection 2 for fire-affected areas.
 
-Computes annual NBR (Normalized Burn Ratio) and NDVI time series from Landsat 5, 7, 8, and 9 surface reflectance data via Google Earth Engine, then quantifies post-fire recovery capacity.
+Extracts annual median Normalized Burn Ratio (NBR) and Normalized Difference Vegetation Index (NDVI) values from Landsat 5, 7, 8, and 9 surface reflectance data via Google Earth Engine. Output is a CSV of raw time series values — analysis is performed separately.
 
 ## Prerequisites
 
@@ -26,13 +26,13 @@ uv run earthengine authenticate
 
 ### Demo mode
 
-Run the built-in demo on the 2011 Dollar Lake fire (Mt. Hood, Oregon):
+Fetch a time series for the Dollar Lake fire location (Mt. Hood, Oregon):
 
 ```bash
 uv run res2fire.py --project YOUR_GEE_PROJECT
 ```
 
-### With a fire shapefile
+### With a shapefile
 
 ```bash
 uv run res2fire.py \
@@ -46,24 +46,24 @@ uv run res2fire.py \
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--fire-shapefile` | `-f` | *(demo mode)* | Path to fire areas vector file |
-| `--output` | `-o` | `fire_recovery.csv` | Output CSV path |
-| `--years-before` | | `3` | Pre-fire years to include |
-| `--years-after` | | `10` | Post-fire years to include |
-| `--month-start` | | `7` | Start month of seasonal window (1-12) |
+| `--output` | `-o` | `fire_timeseries.csv` | Output CSV path |
+| `--start-year` | | `1985` | First year of the time series |
+| `--end-year` | | `2024` | Last year of the time series |
+| `--month-start` | | `6` | Start month of seasonal window (1-12) |
 | `--month-end` | | `8` | End month of seasonal window (1-12) |
 | `--project` | `-p` | | GEE cloud project ID |
 
 ### Example
 
-Analyze 5 years before and 15 years after each fire, using a June-September window:
+Fetch time series from 2000 to 2023 using a July-September window:
 
 ```bash
 uv run res2fire.py \
   -f fires.shp \
-  -o recovery_long.csv \
-  --years-before 5 \
-  --years-after 15 \
-  --month-start 6 \
+  -o timeseries.csv \
+  --start-year 2000 \
+  --end-year 2023 \
+  --month-start 7 \
   --month-end 9 \
   -p my-gee-project
 ```
@@ -72,19 +72,18 @@ uv run res2fire.py \
 
 Any OGR-readable vector format (Shapefile, GeoPackage, GeoJSON, etc.) in **WGS84 (EPSG:4326)**.
 
-### Required columns
+### Required
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `fire_year` | int | Year the fire occurred |
-| geometry | Point, Polygon, or MultiPolygon | Location or perimeter of the burned area |
+| geometry | Point, Polygon, or MultiPolygon | Location or perimeter of the area of interest |
 
 ### Optional columns
 
 | Column | Type | Default | Description |
 |--------|------|---------|-------------|
 | `veg_type` | str | `unknown` | Vegetation type: `broadleaf`, `conifer`, or `macchia` |
-| `name` or `id` | str | row index | Human-readable fire identifier |
+| `name` or `id` | str | row index | Human-readable identifier |
 
 ### Notes
 
@@ -94,50 +93,31 @@ Any OGR-readable vector format (Shapefile, GeoPackage, GeoJSON, etc.) in **WGS84
 
 ### Example attribute table
 
-| name | fire_year | veg_type | geometry |
-|------|-----------|----------|----------|
-| Fire_A | 2017 | broadleaf | POINT(23.5, 39.2) |
-| Fire_B | 2015 | conifer | POLYGON(...) |
-| Fire_C | 2019 | macchia | POLYGON(...) |
+| name | veg_type | geometry |
+|------|----------|----------|
+| Fire_A | broadleaf | POINT(23.5, 39.2) |
+| Fire_B | conifer | POLYGON(...) |
+| Fire_C | macchia | POLYGON(...) |
 
 ## Output
 
-The output CSV contains one row per fire site per year, with the following columns:
+The output CSV contains one row per site per year:
 
 | Column | Description |
 |--------|-------------|
-| `name` | Fire identifier |
+| `name` | Site identifier |
 | `veg_type` | Vegetation type |
-| `fire_year` | Year of fire |
 | `year` | Observation year |
-| `NBR` | Normalized Burn Ratio for that year |
-| `NDVI` | Normalized Difference Vegetation Index for that year |
-| `NBR_pre_fire` | Mean NBR over 3 pre-fire years |
-| `NBR_post_fire_min` | Minimum post-fire NBR |
-| `NBR_latest` | Most recent valid NBR value |
-| `NBR_latest_year` | Year of the latest NBR value |
-| `NBR_delta` | Fire-induced NBR drop |
-| `NBR_recovery_ratio` | Recovery ratio (1.0 = full recovery) |
-| `NDVI_*` | Same metrics for NDVI |
+| `NBR` | Normalized Burn Ratio (annual median, June-August) |
+| `NDVI` | Normalized Difference Vegetation Index (annual median, June-August) |
 
 ## How it works
 
-1. **Data loading** -- Merges Landsat 5 TM, 7 ETM+, 8 OLI, and 9 OLI-2 Collection 2 Level-2 surface reflectance imagery from GEE.
-2. **Preprocessing** -- Applies USGS scale factors, masks clouds/shadows via QA_PIXEL, and renames bands to a common naming scheme.
-3. **Index computation** -- Calculates NBR and NDVI per image.
-4. **Annual composites** -- Produces a pixel-wise median for the seasonal window (default July-August) of each year.
-5. **Value extraction** -- Computes spatial mean of indices over each fire geometry in a single batched GEE request.
-6. **Recovery metrics** -- Compares pre-fire baseline (3-year mean) with post-fire trajectory to derive a recovery ratio.
-
-### Recovery ratio
-
-```
-RR = (V_latest - V_post_min) / (V_pre - V_post_min)
-```
-
-- `RR = 1.0` -- vegetation has fully recovered to pre-fire levels
-- `RR > 1.0` -- vegetation exceeds pre-fire levels
-- `RR < 1.0` -- recovery is still in progress
+1. **Data loading** — Merges Landsat 5 TM, 7 ETM+, 8 OLI, and 9 OLI-2 Collection 2 Level-2 surface reflectance imagery from GEE.
+2. **Preprocessing** — Applies USGS scale factors, masks clouds/shadows via QA_PIXEL, and renames bands to a common naming scheme.
+3. **Index computation** — Calculates NBR and NDVI per image.
+4. **Annual composites** — Produces a pixel-wise median for the seasonal window (default June-August) of each year.
+5. **Value extraction** — Computes spatial mean of indices over each geometry in a single batched GEE request.
 
 ## References
 

@@ -1,17 +1,9 @@
-"""Resilience capacity of burning areas using Landsat Collection 2 time series.
+"""Fetch Landsat Collection 2 NBR/NDVI time series for fire-affected areas.
 
-Analyze vegetation recovery in fire-affected areas by computing annual
-Normalized Burn Ratio (NBR) and Normalized Difference Vegetation Index (NDVI)
-time series from Landsat Collection 2 Level-2 surface reflectance data.
-
-The workflow merges imagery from Landsat 5 TM, 7 ETM+, 8 OLI, and 9 OLI-2,
-applies Collection 2 scale factors and QA_PIXEL cloud/shadow masking, then
-produces per-year median composites within a configurable seasonal window
-(default July--August, roughly corresponding to peak vegetation expansion in
-the Mediterranean and temperate zones).
-
-Recovery is quantified per fire site by comparing pre-fire baseline index
-values with post-fire trajectories, yielding a dimensionless recovery ratio.
+Extracts annual median NBR and NDVI values from Landsat 5 TM, 7 ETM+,
+8 OLI, and 9 OLI-2 Collection 2 Level-2 surface reflectance data via
+Google Earth Engine.  Output is a CSV of raw time series values per site
+per year — no recovery analysis is performed.
 
 Examples
 --------
@@ -26,7 +18,7 @@ Process a shapefile of fire perimeters::
 Notes
 -----
 * Requires an authenticated Google Earth Engine account.
-  Run ``earthengine authenticate`` before first use.
+  Run ``uv run earthengine authenticate`` before first use.
 * Landsat Collection 2 surface reflectance data are already cross-calibrated
   across sensors, so no manual ETM+-to-OLI harmonization is needed.
 
@@ -235,7 +227,7 @@ def get_merged_collection(
     geometry: ee.Geometry,
     start_year: int,
     end_year: int,
-    month_start: int = 7,
+    month_start: int = 6,
     month_end: int = 8,
 ) -> ee.ImageCollection:
     """Build a merged, preprocessed Landsat image collection.
@@ -254,7 +246,7 @@ def get_merged_collection(
     end_year : int
         Last year of the analysis period (inclusive).
     month_start : int, optional
-        First month of the seasonal window (1--12). Default is ``7`` (July).
+        First month of the seasonal window (1--12). Default is ``6`` (June).
     month_end : int, optional
         Last month of the seasonal window (1--12, inclusive).
         Default is ``8`` (August).
@@ -285,7 +277,7 @@ def annual_composites(
     collection: ee.ImageCollection,
     start_year: int,
     end_year: int,
-    month_start: int = 7,
+    month_start: int = 6,
     month_end: int = 8,
 ) -> list[dict]:
     """Reduce an image collection to annual median composites.
@@ -306,7 +298,7 @@ def annual_composites(
     end_year : int
         Last year (inclusive).
     month_start : int, optional
-        Start month of the seasonal window. Default is ``7``.
+        Start month of the seasonal window. Default is ``6``.
     month_end : int, optional
         End month of the seasonal window (inclusive). Default is ``8``.
 
@@ -384,151 +376,22 @@ def extract_values_batch(
 
 
 # ---------------------------------------------------------------------------
-# Recovery metrics
-# ---------------------------------------------------------------------------
-
-def compute_recovery(
-    time_series: list[dict],
-    fire_year: int,
-    index: str = "NBR",
-) -> dict:
-    """Compute vegetation recovery metrics for a single fire event.
-
-    Metrics are derived by comparing pre-fire baseline values with the
-    post-fire trajectory of a spectral vegetation index.
-
-    The **recovery ratio** is defined as::
-
-        RR = (V_latest - V_post_min) / (V_pre - V_post_min)
-
-    where *V_pre* is the mean index value over the three years preceding
-    the fire, *V_post_min* is the minimum post-fire value, and *V_latest*
-    is the most recent valid observation.  A ratio of 1.0 indicates that
-    the vegetation has returned to its pre-fire baseline.
-
-    Parameters
-    ----------
-    time_series : list[dict]
-        Annual index values as returned by :func:`extract_values_batch`.
-    fire_year : int
-        Calendar year in which the fire occurred.
-    index : str, optional
-        Name of the spectral index to evaluate (``"NBR"`` or ``"NDVI"``).
-        Default is ``"NBR"``.
-
-    Returns
-    -------
-    dict
-        A dictionary with keys:
-
-        * ``pre_fire`` (*float | None*) -- Mean index value for up to 3
-          pre-fire years.
-        * ``post_fire_min`` (*float | None*) -- Minimum post-fire index value.
-        * ``latest`` (*float | None*) -- Index value for the most recent
-          year with valid data.
-        * ``latest_year`` (*int | None*) -- Year of the ``latest`` value.
-        * ``delta`` (*float | None*) -- Magnitude of the fire-induced drop
-          (``pre_fire - post_fire_min``).
-        * ``recovery_ratio`` (*float | None*) -- Dimensionless recovery
-          ratio (1.0 = full recovery).
-    """
-    pre = [r[index] for r in time_series if r[index] is not None and r["year"] < fire_year]
-    post = {r["year"]: r[index] for r in time_series if r[index] is not None and r["year"] >= fire_year}
-
-    if not pre or not post:
-        return {"pre_fire": None, "post_fire_min": None, "latest": None,
-                "latest_year": None, "delta": None, "recovery_ratio": None}
-
-    pre_mean = sum(pre[-3:]) / len(pre[-3:])
-    post_min = min(post.values())
-
-    latest_year = max(post.keys())
-    latest = post[latest_year]
-    delta = pre_mean - post_min
-
-    recovery_ratio = (latest - post_min) / delta if delta > 0 else None
-
-    return {
-        "pre_fire": round(pre_mean, 4),
-        "post_fire_min": round(post_min, 4),
-        "latest": round(latest, 4),
-        "latest_year": latest_year,
-        "delta": round(delta, 4),
-        "recovery_ratio": round(recovery_ratio, 4) if recovery_ratio is not None else None,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Vegetation type summary
-# ---------------------------------------------------------------------------
-
-def _print_veg_type_summary(all_rows: list[dict]) -> None:
-    """Print a summary table of recovery metrics grouped by vegetation type.
-
-    For each vegetation type present in the results, computes the mean
-    NBR and NDVI recovery ratios across all fire sites of that type and
-    prints a formatted table to stdout.
-
-    Parameters
-    ----------
-    all_rows : list[dict]
-        The full list of output rows (one per fire site per year).
-        Each row must contain ``veg_type``, ``name``, ``NBR_recovery_ratio``,
-        and ``NDVI_recovery_ratio`` keys.
-    """
-    # Collect one recovery ratio per fire site (avoid counting each year row)
-    sites: dict[str, dict[str, list[float]]] = {}
-    seen: set[tuple[str, str]] = set()
-
-    for r in all_rows:
-        veg = r["veg_type"]
-        name = r["name"]
-        if (veg, name) in seen:
-            continue
-        seen.add((veg, name))
-
-        if veg not in sites:
-            sites[veg] = {"nbr": [], "ndvi": [], "count": 0}
-
-        sites[veg]["count"] += 1
-        if r.get("NBR_recovery_ratio") is not None:
-            sites[veg]["nbr"].append(r["NBR_recovery_ratio"])
-        if r.get("NDVI_recovery_ratio") is not None:
-            sites[veg]["ndvi"].append(r["NDVI_recovery_ratio"])
-
-    print("\n" + "=" * 64)
-    print("Recovery Summary by Vegetation Type")
-    print("=" * 64)
-    print(f"{'Type':<20} {'Sites':>5}  {'Mean NBR RR':>11}  {'Mean NDVI RR':>12}")
-    print("-" * 64)
-
-    for veg in sorted(sites):
-        s = sites[veg]
-        n = s["count"]
-        nbr_mean = f"{sum(s['nbr']) / len(s['nbr']):.4f}" if s["nbr"] else "N/A"
-        ndvi_mean = f"{sum(s['ndvi']) / len(s['ndvi']):.4f}" if s["ndvi"] else "N/A"
-        print(f"{veg:<20} {n:>5}  {nbr_mean:>11}  {ndvi_mean:>12}")
-
-    print("=" * 64)
-
-
-# ---------------------------------------------------------------------------
 # Shapefile processing
 # ---------------------------------------------------------------------------
 
 def process_shapefile(
     shp_path: str,
-    years_before: int,
-    years_after: int,
+    start_year: int,
+    end_year: int,
     month_start: int,
     month_end: int,
     output_csv: str,
 ) -> None:
-    """Process a fire-areas shapefile and write recovery results to CSV.
+    """Process a fire-areas shapefile and write time series to CSV.
 
     Iterates over each feature in the shapefile, builds a Landsat time
-    series around the fire year, extracts annual NBR/NDVI values, computes
-    recovery metrics, and writes all results to a single CSV file.
+    series for the requested year range, extracts annual NBR/NDVI values,
+    and writes all results to a single CSV file.
 
     Parameters
     ----------
@@ -536,49 +399,33 @@ def process_shapefile(
         Path to an OGR-readable vector file (Shapefile, GeoPackage, etc.).
         Must contain the following attribute columns:
 
-        * ``fire_year`` (*int*, **required**) -- Year of the fire event.
         * ``veg_type`` (*str*, optional) -- Vegetation type label
           (e.g. ``"broadleaf"``, ``"conifer"``, ``"macchia"``).
         * ``name`` or ``id`` (*str*, optional) -- Human-readable feature
           identifier.
 
         Geometry may be Point, Polygon, or MultiPolygon.
-    years_before : int
-        Number of pre-fire years to include in the time series.
-    years_after : int
-        Number of post-fire years to include in the time series.
+    start_year : int
+        First year of the time series (inclusive).
+    end_year : int
+        Last year of the time series (inclusive).
     month_start : int
         Start month of the seasonal compositing window (1--12).
     month_end : int
         End month of the seasonal compositing window (1--12, inclusive).
     output_csv : str
         Destination path for the output CSV file.
-
-    Raises
-    ------
-    SystemExit
-        If the shapefile does not contain the required ``fire_year`` column.
     """
     gdf = gpd.read_file(shp_path)
-
-    required = {"fire_year"}
-    missing = required - set(gdf.columns)
-    if missing:
-        print(f"Error: shapefile missing columns: {missing}")
-        sys.exit(1)
 
     all_rows = []
 
     for idx, row in gdf.iterrows():
-        fire_year = int(row["fire_year"])
         veg_type = row.get("veg_type", "unknown")
         name = row.get("name", row.get("id", str(idx)))
         geom = row.geometry
 
-        start_year = fire_year - years_before
-        end_year = fire_year + years_after
-
-        print(f"Processing fire '{name}' ({veg_type}), year {fire_year}, "
+        print(f"Processing '{name}' ({veg_type}), "
               f"range {start_year}-{end_year}...")
 
         ee_geom = ee.Geometry(mapping(geom))
@@ -593,17 +440,11 @@ def process_shapefile(
                                        month_start, month_end)
         ts = extract_values_batch(composites, ee_geom)
 
-        recovery_nbr = compute_recovery(ts, fire_year, "NBR")
-        recovery_ndvi = compute_recovery(ts, fire_year, "NDVI")
-
         for r in ts:
             all_rows.append({
                 "name": name,
                 "veg_type": veg_type,
-                "fire_year": fire_year,
                 **r,
-                **{f"NBR_{k}": v for k, v in recovery_nbr.items()},
-                **{f"NDVI_{k}": v for k, v in recovery_ndvi.items()},
             })
 
     if all_rows:
@@ -613,7 +454,6 @@ def process_shapefile(
             writer.writeheader()
             writer.writerows(all_rows)
         print(f"\nResults written to {output_csv}")
-        _print_veg_type_summary(all_rows)
     else:
         print("No results produced.")
 
@@ -623,40 +463,36 @@ def process_shapefile(
 # ---------------------------------------------------------------------------
 
 def run_demo(
-    years_before: int,
-    years_after: int,
+    start_year: int,
+    end_year: int,
     month_start: int,
     month_end: int,
-    output_csv: str = "fire_recovery.csv",
+    output_csv: str = "fire_timeseries.csv",
 ) -> None:
-    """Run a demonstration analysis on the 2011 Dollar Lake fire (Mt. Hood, OR).
+    """Run a demonstration on the Dollar Lake fire location (Mt. Hood, OR).
 
-    Prints an annual NBR/NDVI table and recovery metrics to stdout, and
-    writes results to a CSV file.
+    Fetches annual NBR/NDVI time series and writes to CSV.
 
     Parameters
     ----------
-    years_before : int
-        Number of pre-fire years.
-    years_after : int
-        Number of post-fire years.
+    start_year : int
+        First year of the time series.
+    end_year : int
+        Last year of the time series.
     month_start : int
         Start month of the seasonal window.
     month_end : int
         End month of the seasonal window.
     output_csv : str, optional
         Destination path for the output CSV file. Default is
-        ``"fire_recovery.csv"``.
+        ``"fire_timeseries.csv"``.
     """
-    fire_year = 2011
     lat, lon = 45.3311, -121.7331
     name = "Dollar Lake"
     veg_type = "conifer"
-    start_year = fire_year - years_before
-    end_year = fire_year + years_after
 
-    print(f"Demo: {name} fire ({lat}, {lon}), year {fire_year}")
-    print(f"Analysis window: {start_year}-{end_year}, months {month_start}-{month_end}\n")
+    print(f"Demo: {name} ({lat}, {lon})")
+    print(f"Time series: {start_year}-{end_year}, months {month_start}-{month_end}\n")
 
     point = ee.Geometry.Point([lon, lat])
     buffer = point.buffer(500)
@@ -674,30 +510,12 @@ def run_demo(
         ndvi = f"{r['NDVI']:.4f}" if r["NDVI"] is not None else "   N/A"
         print(f"{r['year']:>6}  {nbr:>8}  {ndvi:>8}")
 
-    print()
-    for index in ("NBR", "NDVI"):
-        rec = compute_recovery(ts, fire_year, index)
-        print(f"{index} Recovery:")
-        print(f"  Pre-fire mean:  {rec['pre_fire']}")
-        print(f"  Post-fire min:  {rec['post_fire_min']}")
-        print(f"  Latest value:   {rec['latest']} ({rec['latest_year']})")
-        print(f"  Drop (delta):   {rec['delta']}")
-        print(f"  Recovery ratio: {rec['recovery_ratio']}")
-        print()
-
-    # Write CSV
-    recovery_nbr = compute_recovery(ts, fire_year, "NBR")
-    recovery_ndvi = compute_recovery(ts, fire_year, "NDVI")
-
     rows = []
     for r in ts:
         rows.append({
             "name": name,
             "veg_type": veg_type,
-            "fire_year": fire_year,
             **r,
-            **{f"NBR_{k}": v for k, v in recovery_nbr.items()},
-            **{f"NDVI_{k}": v for k, v in recovery_ndvi.items()},
         })
 
     keys = rows[0].keys()
@@ -705,7 +523,7 @@ def run_demo(
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Results written to {output_csv}")
+    print(f"\nResults written to {output_csv}")
 
 
 # ---------------------------------------------------------------------------
@@ -713,31 +531,31 @@ def run_demo(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Parse command-line arguments and run the analysis."""
+    """Parse command-line arguments and fetch time series."""
     parser = argparse.ArgumentParser(
-        description="Analyze vegetation recovery in fire-affected areas "
-                    "using Landsat Collection 2 time series (NBR & NDVI)."
+        description="Fetch annual NBR & NDVI time series from Landsat "
+                    "Collection 2 for fire-affected areas."
     )
     parser.add_argument(
         "--fire-shapefile", "-f",
-        help="Path to fire areas shapefile. Must contain 'fire_year' column, "
-             "optionally 'veg_type' and 'name'. If omitted, runs a demo.",
+        help="Path to fire areas shapefile. Optionally contains 'veg_type' "
+             "and 'name' columns. If omitted, runs a demo.",
     )
     parser.add_argument(
-        "--output", "-o", default="fire_recovery.csv",
-        help="Output CSV path (default: fire_recovery.csv)",
+        "--output", "-o", default="fire_timeseries.csv",
+        help="Output CSV path (default: fire_timeseries.csv)",
     )
     parser.add_argument(
-        "--years-before", type=int, default=3,
-        help="Years of pre-fire data to include (default: 3)",
+        "--start-year", type=int, default=1985,
+        help="First year of the time series (default: 1985)",
     )
     parser.add_argument(
-        "--years-after", type=int, default=10,
-        help="Years of post-fire data to include (default: 10)",
+        "--end-year", type=int, default=2024,
+        help="Last year of the time series (default: 2024)",
     )
     parser.add_argument(
-        "--month-start", type=int, default=7,
-        help="Start month for annual window (default: 7 = July)",
+        "--month-start", type=int, default=6,
+        help="Start month for annual window (default: 6 = June)",
     )
     parser.add_argument(
         "--month-end", type=int, default=8,
@@ -756,21 +574,21 @@ def main() -> None:
         else:
             ee.Initialize()
     except ee.EEException:
-        print("Earth Engine not authenticated. Run: earthengine authenticate")
+        print("Earth Engine not authenticated. Run: uv run earthengine authenticate")
         sys.exit(1)
 
     if args.fire_shapefile:
         process_shapefile(
             args.fire_shapefile,
-            args.years_before,
-            args.years_after,
+            args.start_year,
+            args.end_year,
             args.month_start,
             args.month_end,
             args.output,
         )
     else:
         print("No shapefile provided — running demo.\n")
-        run_demo(args.years_before, args.years_after,
+        run_demo(args.start_year, args.end_year,
                  args.month_start, args.month_end, args.output)
 
 
